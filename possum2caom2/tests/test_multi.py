@@ -95,6 +95,11 @@ def test_main_app(header_mock, clients_mock, test_config, test_data_dir):
     clients_mock.metadata_client.read.return_value = None
     f_list = glob.glob(f'{test_dir}/*.header')
     observation = None
+    test_observable = Mock()
+    meta_producer_mock = PropertyMock(return_value='test_possum/0.0.0')
+    type(test_observable).meta_producer = meta_producer_mock
+    test_config.change_working_directory('/tmp')
+    test_reporter = mc.ExecutionReporter(test_config, test_observable)
     for f_name in f_list:
         def _sandbox_mock(_, obs_id):
             sc2_name = f_name.replace('.fits.header', '.sc2.xml')
@@ -109,15 +114,12 @@ def test_main_app(header_mock, clients_mock, test_config, test_data_dir):
         metadata_reader.set(storage_name)
         file_type = 'application/fits'
         metadata_reader.file_info[storage_name.file_uri].file_type = file_type
-        test_observable = Mock()
-        meta_producer_mock = PropertyMock(return_value='test_possum/0.0.0')
-        type(test_observable).meta_producer = meta_producer_mock
         kwargs = {
             'storage_name': storage_name,
             'metadata_reader': metadata_reader,
             'config': test_config,
             'clients': clients_mock,
-            'observable': test_observable,
+            'reporter': test_reporter,
         }
         observation = fits2caom2_augmentation.visit(observation, **kwargs)
 

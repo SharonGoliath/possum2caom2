@@ -121,8 +121,6 @@ class PossumName(StorageName):
         self._position = None
         self._resolution = None
         self._version = None
-        # the renamed files in a list
-        self._stage_names = []
         super().__init__(file_name=basename(entry.replace('.header', '')), source_names=[entry])
 
     def __str__(self):
@@ -155,10 +153,6 @@ class PossumName(StorageName):
     @property
     def spatial_resolution(self):
         return float(self._resolution.replace('asec', ''))
-
-    @property
-    def stage_names(self):
-        return self._stage_names
 
     @property
     def thumb(self):
@@ -205,7 +199,6 @@ class PossumName(StorageName):
             temp = f'{temp2}_{version}.fits'
         else:
             temp = f'{temp2}_{version}.fits{x[1]}'
-        self._stage_names.append(temp)
         return temp
 
     def set_destination_uris(self):
@@ -278,9 +271,6 @@ class PossumName(StorageName):
                 self._product_id = 'raw_qu'
         if self._product_id is None:
             raise CadcException(f'Unexpected raw file naming pattern {self._file_id}')
-
-    def set_staging_name(self, value):
-        self._stage_names.append(value)
 
     def un_name(self):
         """Undo the renaming from Pawsey Acacia, to be able to work backwards for sc2 Observation metadata."""

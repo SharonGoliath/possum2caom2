@@ -145,13 +145,13 @@ class Possum1DMapping(cc.TelescopeMapping):
         bp.set('Artifact.releaseType', ReleaseType.DATA)
         self._logger.debug('Done accumulate_bp.')
 
-    def update(self, file_info):
+    def update(self):
         """Called to fill multiple CAOM model elements and/or attributes
         (an n:n relationship between TDM attributes and CAOM attributes).
         """
         self._logger.debug(f'Begin update for {self._observation.observation_id}.')
         try:
-            super().update(file_info)
+            super().update()
             Possum1DMapping.value_repair.repair(self._observation)
 
             # the super call removes empty Parts before sending the Observation for server-side computing here
@@ -561,11 +561,11 @@ class Pilot1OutputSpatial(Possum1DMapping):
 
         self._logger.debug('Done accumulate_bp.')
 
-    def update(self, file_info):
+    def update(self):
         """Called to fill multiple CAOM model elements and/or attributes
         (an n:n relationship between TDM attributes and CAOM attributes).
         """
-        super().update(file_info)
+        super().update()
         for plane in self._observation.planes.values():
             for artifact in plane.artifacts.values():
                 if artifact.uri != self._storage_name.file_uri:

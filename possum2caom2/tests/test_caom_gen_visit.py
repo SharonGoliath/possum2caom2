@@ -107,12 +107,14 @@ def test_main_app(header_mock, clients_mock, test_config, test_name):
     test_observable = Mock()
     meta_producer_mock = PropertyMock(return_value='test_possum/0.0.0')
     type(test_observable).meta_producer = meta_producer_mock
+    test_config.change_working_directory('/tmp')
+    test_reporter = mc.ExecutionReporter(test_config, test_observable)
     kwargs = {
         'storage_name': storage_name,
         'metadata_reader': metadata_reader,
         'config': test_config,
         'clients': clients_mock,
-        'observable': test_observable,
+        'reporter': test_reporter,
     }
     expected_fqn = f'{test_name.replace(".fits.header", "")}.expected.xml'
     in_fqn = expected_fqn.replace('.expected', '.in')

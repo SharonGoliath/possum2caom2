@@ -67,11 +67,8 @@
 #
 
 import glob
-import json
 import logging
 import os
-import shutil
-import traceback
 
 import numpy as np
 from astropy import units
@@ -79,22 +76,16 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy_healpix import HEALPix
-from copy import deepcopy
-from datetime import datetime
 
-from cadcdata.storageinv import FileInfo
-from caom2pipe.astro_composable import check_fitsverify
-from caom2pipe.client_composable import ClientCollection, repo_create, repo_get, repo_update
-from caom2pipe.data_source_composable import IncrementalDataSource, ListDirSeparateDataSource
-from caom2pipe.execute_composable import OrganizeExecutes
-from caom2pipe.manage_composable import CadcException, Config, compute_md5sum, create_dir, exec_cmd, exec_cmd_info
-from caom2pipe.manage_composable import ExecutionReporter, increment_time, make_datetime, Observable, StorageName, TaskType
+from caom2pipe.client_composable import ClientCollection
+from caom2pipe.data_source_composable import RemoteRcloneIncrementalDataSource
+from caom2pipe.manage_composable import Config, exec_cmd
+from caom2pipe.manage_composable import ExecutionReporter, Observable, StorageName, TaskType
 from caom2pipe.name_builder_composable import EntryBuilder
-from caom2pipe.reader_composable import FileMetadataReader
-from caom2pipe.run_composable import set_logging, StateRunner, TodoRunner
-from caom2pipe.transfer_composable import CadcTransfer, Transfer
+from caom2pipe.reader_composable import FileMetadataReader, RemoteRcloneMetadataReader
+from caom2pipe.remote_composable import ExecutionUnit, ExecutionUnitOrganizeExecutes
+from caom2pipe.run_composable import ExecutionUnitStateRunner, set_logging
 from caom2repo import CAOM2RepoClient
-from caom2utils.data_util import get_file_type
 from possum2caom2 import fits2caom2_augmentation, preview_augmentation, spectral_augmentation
 from possum2caom2.storage_name import PossumName
 
@@ -126,153 +117,21 @@ class RCloneClients(ClientCollection):
         return self._server_side_ctor_client
 
 
-class RemoteMetadataReader(FileMetadataReader):
-    def __init__(self):
-        super().__init__()
-        self._storage_names = {}
-        self._max_dt = None
-
-    @property
-    def max_dt(self):
-        return self._max_dt
-
-    @property
-    def storage_names(self):
-        return self._storage_names
-
-    def _retrieve_file_info(self, key, source_name):
-        raise NotImplementedError
-
-    def get_time_box_work_parameters(self, prev_exec_time, exec_time):
-        self._logger.debug(f'Begin get_time_box_work_parameters from {prev_exec_time} to {exec_time}')
-        count = 0
-        max_time_box = prev_exec_time
-        for entry in self._file_info.values():
-            if prev_exec_time < entry.lastmod <= exec_time:
-                count += 1
-                max_time_box = max(prev_exec_time, entry.lastmod)
-        self._logger.debug(f'End get_time_box_work_parameters with count {count}')
-        return count, max_time_box
-
-    def reset(self):
-        pass
-
-    def set(self, storage_name):
-        raise NotImplementedError
-
-    def set_file_info(self, storage_name):
-        """
-        Path elements from the JSON listing:
-        components
-        components mfs
-        components mfs i
-        components mfs mfs
-        components mfs w
-        components survey
-        components survey i
-        components survey q
-        components survey u
-        components survey w
-        :param storage_name str JSON output from rclone lsjson command
-        """
-        self._logger.debug('Begin set_file_info with rclone lsjson output')
-        content = json.loads(storage_name)
-        for entry in content:
-            name = entry.get('Name')
-            # if name.startswith('PSM') or '.fits' in name:
-            if '.fits' in name:
-                # keys are destination URIs
-                try:
-                    possum_name = PossumName(name)
-                except CadcException as e:
-                    self._logger.error(e)
-                    self._logger.debug(traceback.format_exc())
-                    continue
-                if possum_name.file_uri not in self._file_info:
-                    self._logger.debug(f'Retrieve FileInfo for {possum_name.file_uri}')
-                    self._file_info[possum_name.file_uri] = FileInfo(
-                        id=possum_name.file_uri,
-                        file_type=get_file_type(name),
-                        size=entry.get('Size'),
-                        lastmod=make_datetime(entry.get('ModTime')),
-                    )
-                    if self._max_dt:
-                        self._max_dt = max(self._file_info[possum_name.file_uri].lastmod, self._max_dt)
-                    else:
-                        self._max_dt = self._file_info[possum_name.file_uri].lastmod
-                    self._storage_names[possum_name.file_uri] = possum_name
-        self._logger.debug(f'End set_file_info with max datetime {self._max_dt}')
-
-    def set_headers(self, storage_name, fqn):
-        self._logger.debug(f'Begin set_headers for {storage_name.file_name}')
-        for entry in storage_name.destination_uris:
-            if entry not in self._headers and os.path.basename(entry) == os.path.basename(fqn):
-                self._logger.debug(f'Retrieve headers for {entry}')
-                self._retrieve_headers(entry, fqn)
-        self._logger.debug('End set_headers')
-
-
-class TodoMetadataReader(FileMetadataReader):
-    def __init__(self, remote_metadata_reader):
-        super().__init__()
-        self._remote_metadata_reader = remote_metadata_reader
-
-    def _retrieve_file_info(self, key, source_name):
-        for storage_name in self._remote_metadata_reader.storage_names.values():
-            for file_name in storage_name.stage_names:
-                if key.endswith(file_name):
-                    # the stage_names are the renamed values
-                    self._logger.debug(f'Found remote FileInfo entry for {file_name} in {storage_name.file_uri}')
-                    self._file_info[key] = self._remote_metadata_reader.file_info.get(storage_name.file_uri)
-                    # missing md5sum - TODO - maybe rclone can report this
-                    md5_sum = compute_md5sum(source_name)
-                    self._file_info[key].md5sum = f'md5:{md5_sum}'
-
-
-class RemoteIncrementalDataSource(IncrementalDataSource):
+class RemoteIncrementalDataSource(RemoteRcloneIncrementalDataSource):
 
     def __init__(self, config, start_key, metadata_reader, **kwargs):
-        super().__init__(config, start_key)
-        self._data_source_extensions = config.lookup.get('rclone_include_pattern')
-        self._metadata_reader = metadata_reader
-        self._kwargs = kwargs
-        # adjust config file syntax for the data sources, which was done so it would work with basic yaml
-        if 'pawsey' in start_key:
-            self._remote_key = start_key.replace('/', ':', 1)
-        else:
-            self._remote_key = start_key
-
-    def _capture_todo(self):
-        self._reporter.capture_todo(len(self._metadata_reader.file_info), self._rejected_files, self._skipped_files)
-        # do not need the record of the rejected or skipped files any longer
-        self._rejected_files = 0
-        self._skipped_files = 0
-
-    def _initialize_end_dt(self):
-        self._logger.debug('Begin _initialize_end_dt')
-        end_timestamp = self._state.bookmarks.get(self._start_key).get('end_timestamp')
-        if end_timestamp is None:
-            output = exec_cmd_info(f'rclone lsjson {self._remote_key} --recursive --max-age={self._start_dt.isoformat()} --include={self._data_source_extensions}')
-        else:
-            output = exec_cmd_info(f'rclone lsjson {self._remote_key} --recursive --max-age={self._start_dt.isoformat()} --min-age={end_timestamp.isoformat()} --include={self._data_source_extensions}')
-
-        self._metadata_reader.set_file_info(output)
-        if self._metadata_reader.max_dt:
-            self._end_dt = self._metadata_reader.max_dt
-        else:
-            if end_timestamp:
-                self._end_dt = make_datetime(end_timestamp)
-            else:
-                self._end_dt = datetime.now()
-        self._capture_todo()
-        self._logger.debug(f'End _initialize_end_dt with {self._end_dt}')
+        super().__init__(config, start_key, metadata_reader, **kwargs)
 
     def get_time_box_work(self, prev_exec_dt, exec_dt):
         self._logger.debug('Begin get_time_box_work')
         self._kwargs['prev_exec_dt'] = prev_exec_dt
         self._kwargs['exec_dt'] = exec_dt
         self._kwargs['metadata_reader'] = self._metadata_reader
-        execution_unit = ExecutionUnit(self._config, **self._kwargs)
+        self._kwargs['builder'] = EntryBuilder(PossumName)
+        self._kwargs['meta_visitors'] = META_VISITORS
+        self._kwargs['data_visitors'] = DATA_VISITORS
+        self._kwargs['staged_metadata_reader'] = FileMetadataReader()
+        execution_unit = PossumExecutionUnit(self._config, **self._kwargs)
         execution_unit.num_entries, execution_unit.entry_dt = self._metadata_reader.get_time_box_work_parameters(prev_exec_dt, exec_dt)
         if execution_unit.num_entries > 0:
             execution_unit.start()
@@ -287,260 +146,10 @@ class RemoteIncrementalDataSource(IncrementalDataSource):
         return execution_unit
 
 
-class RemoteListDirDataSource(ListDirSeparateDataSource):
-
-    def __init__(self, config):
-        super().__init__(config)
-        self._num_entries = None
-
-    @property
-    def num_entries(self):
-        return self._num_entries
-
-    def _capture_todo(self):
-        # do not update total record count, that's already been done in the RemoteIncrementalDataSource
-        pass
-
-    def default_filter(self, entry):
-        work_with_file = False
-        if super().default_filter(entry):
-            if check_fitsverify(entry.path):
-                work_with_file = True
-        return work_with_file
-
-    def get_work(self):
-        result = super().get_work()
-        self._num_entries = len(result)
-        return result
-
-
-class ExecutionUnitStateRunner(StateRunner):
-    """
-    This class brings together the mechanisms for identifying the time-boxed lists of work to be done (DataSource
-    specializations), and the mechanisms for translating a unit of work into something that CaomExecute can work with.
-
-    For retries, accumulate the retry-able entries in a single file for each time-box interval, for each data source.
-    After all the incremental execution, attempt the retries.
-    """
-
-    def __init__(
-        self,
-        config,
-        organizer,
-        data_sources,
-        observable,
-        reporter,
-    ):
-        super().__init__(
-            config=config,
-            organizer=organizer,
-            builder=None,
-            data_sources=data_sources,
-            metadata_reader=None,
-            observable=observable,
-            reporter=reporter,
-        )
-
-    def _process_data_source(self, data_source):
-        """
-        Uses an iterable with an instance of StateRunnerMeta.
-
-        :return: 0 for success, -1 for failure
-        """
-        data_source.initialize_start_dt()
-        data_source.initialize_end_dt()
-        prev_exec_time = data_source.start_dt
-        incremented = increment_time(prev_exec_time, self._config.interval)
-        exec_time = min(incremented, data_source.end_dt)
-
-        self._logger.info(f'Starting at {prev_exec_time}, ending at {data_source.end_dt}')
-        result = 0
-        if prev_exec_time == data_source.end_dt:
-            self._logger.info(f'Start time is the same as end time {prev_exec_time}, stopping.')
-            exec_time = prev_exec_time
-        else:
-            cumulative = 0
-            result = 0
-            while exec_time <= data_source.end_dt:
-                self._logger.info(f'Processing {data_source.start_key} from {prev_exec_time} to {exec_time}')
-                save_time = exec_time
-                self._reporter.set_log_location(self._config)
-                work = data_source.get_time_box_work(prev_exec_time, exec_time)
-                if work.num_entries > 0:
-                    try:
-                        self._logger.info(f'Processing {work.num_entries} entries.')
-                        result |= work.do()
-                    finally:
-                        work.stop()
-                    save_time = min(work.entry_dt, exec_time)
-                    self._record_retries()
-                self._record_progress(work.num_entries, cumulative, prev_exec_time, save_time)
-                data_source.save_start_dt(save_time)
-                if exec_time == data_source.end_dt:
-                    # the last interval will always have the exec time equal to the end time, which will fail the
-                    # while check so leave after the last interval has been processed
-                    #
-                    # but the while <= check is required so that an interval smaller than exec_time -> end_time will
-                    # get executed, so don't get rid of the '=' in the while loop comparison, just because this one
-                    # exists
-                    break
-                prev_exec_time = exec_time
-                new_time = increment_time(prev_exec_time, self._config.interval)
-                exec_time = min(new_time, data_source.end_dt)
-                cumulative += work.num_entries
-
-        data_source.save_start_dt(exec_time)
-        msg = f'Done for {data_source.start_key}, saved state is {exec_time}'
-        self._logger.info('=' * len(msg))
-        self._logger.info(msg)
-        self._logger.info(f'{self._reporter.success} of {self._reporter.all} records processed correctly.')
-        self._logger.info('=' * len(msg))
-        self._logger.debug(f'End _process_data_source with result {result}')
-        return result
-
-
-class ExecutionUnit:
-    """
-    Could be:
-    - 1 file
-    - 1 rclone timebox
-    - 1 group of files for horizontal scaling deployment
-
-    Temporal Cohesion between logging setup/teardown and workspace setup/teardown.
-    """
+class PossumExecutionUnit(ExecutionUnit):
 
     def __init__(self, config, **kwargs):
-        """
-        :param root_directory str staging space location
-        :param label str name of the execution unit. Should be unique and conform to posix directory naming standards.
-        """
-        self._log_fqn = None
-        self._logging_level = None
-        self._log_handler = None
-        self._task_types = config.task_types
-        self._config = config
-        self._entry_dt = None
-        self._clients = kwargs.get('clients')
-        # self._data_source = kwargs.get('data_source')
-        self._remote_metadata_reader = kwargs.get('metadata_reader')
-        self._observable = kwargs.get('observable')
-        self._reporter = kwargs.get('reporter')
-        self._prev_exec_dt = kwargs.get('prev_exec_dt')
-        self._exec_dt = kwargs.get('exec_dt')
-        self._label = (
-            f'{self._prev_exec_dt.isoformat().replace(":", "_").replace(".", "_")}_'
-            f'{self._exec_dt.isoformat().replace(":", "_").replace(".", "_")}'
-        )
-        self._working_directory = os.path.join(config.working_directory, self._label)
-        if config.log_to_file:
-            if config.log_file_directory:
-                self._log_fqn = os.path.join(config.log_file_directory, self._label)
-            else:
-                self._log_fqn = os.path.join(config.working_directory, self._label)
-            self._logging_level = config.logging_level
-        self._num_entries = None
-        self._central_wavelengths = {}  # key is original ObservationID, value is central wavelength
-        self._observations = {}  # key is original ObservationID, values are Observation instances
-        self._local_metadata_reader = None
-        self._logger = logging.getLogger(self.__class__.__name__)
-
-    @property
-    def entry_dt(self):
-        return self._entry_dt
-
-    @entry_dt.setter
-    def entry_dt(self, value):
-        self._entry_dt = value
-
-    @property
-    def label(self):
-        return self._label
-
-    @property
-    def num_entries(self):
-        return self._num_entries
-
-    @num_entries.setter
-    def num_entries(self, value):
-        self._num_entries = value
-
-    @property
-    def working_directory(self):
-        return self._working_directory
-
-    def do(self):
-        """Make the execution unit one time-boxed copy from the DataSource to staging space, followed by a TodoRunner
-        pointed to the staging space, and using that staging space with use_local_files: True. """
-        self._logger.info(f'Begin do for {self._num_entries} entries in {self._label}')
-        self._rename()
-        result = None
-        # set a Config instance to use the staging space with 'use_local_files: True'
-        todo_config = deepcopy(self._config)
-        todo_config.use_local_files = True
-        todo_config.data_sources = [self._working_directory]
-        todo_config.recurse_data_sources = True
-        self._logger.debug(f'do config for TodoRunner: {todo_config}')
-        self._local_metadata_reader = TodoMetadataReader(self._remote_metadata_reader)
-        organizer = OrganizeExecutes(
-            todo_config,
-            META_VISITORS,
-            DATA_VISITORS,
-            None,  # chooser
-            Transfer(),
-            CadcTransfer(self._clients.data_client),
-            self._local_metadata_reader,
-            self._clients,
-            self._observable,
-        )
-        local_data_source = RemoteListDirDataSource(todo_config)
-        local_data_source.reporter = self._reporter
-        builder = EntryBuilder(PossumName)
-        # start a TodoRunner with the new Config instance, data_source, and metadata_reader
-        todo_runner = TodoRunner(
-            todo_config,
-            organizer,
-            builder=builder,
-            data_sources=[local_data_source],
-            metadata_reader=self._local_metadata_reader,
-            observable=self._observable,
-            reporter=self._reporter,
-        )
-        result = todo_runner.run()
-        if todo_config.cleanup_files_when_storing:
-            result |= todo_runner.run_retry()
-
-        if local_data_source.num_entries != self._num_entries:
-            self._logger.error(
-                f'Expected to process {self._num_entries} entries, but found {local_data_source.num_entries} entries.'
-            )
-            result = -1
-        self._logger.debug(f'End do with result {result}')
-        return result
-
-    def start(self):
-        self._set_up_file_logging()
-        self._create_workspace()
-
-    def stop(self):
-        self._clean_up_workspace()
-        self._unset_file_logging()
-
-    def _create_workspace(self):
-        """Create the working area if it does not already exist."""
-        self._logger.debug(f'Create working directory {self._working_directory}')
-        create_dir(self._working_directory)
-
-    def _clean_up_workspace(self):
-        """Remove a directory and all its contents. Only do this if there is not a 'SCRAPE' task type, since the
-        point of scraping is to be able to look at the pipeline execution artefacts once the processing is done.
-        """
-        # if os.path.exists(self._working_directory) and TaskType.SCRAPE not in self._task_types and self._config.cleanup_files_when_storing:
-        if os.path.exists(self._working_directory) and TaskType.SCRAPE not in self._task_types:
-            entries = glob.glob('*', root_dir=self._working_directory, recursive=True)
-            if (self._config.cleanup_files_when_storing and len(entries) > 0) or len(entries) == 0:
-                shutil.rmtree(self._working_directory)
-                self._logger.error(f'Removed working directory {self._working_directory} and contents.')
-        self._logger.debug('End _clean_up_workspace')
+        super().__init__(config, **kwargs)
 
     def _RADEC_hms_dms_to_string(self, c: SkyCoord):
         """
@@ -718,8 +327,7 @@ class ExecutionUnit:
         }
         return fits.Header(d)
 
-
-    def _rename(self):
+    def _prepare(self):
         """The files from Pawsey need to be renamed. Some of the metadata to rename the files is most easily found
         in the plane-level metadata that is calculated server-side.
 
@@ -730,14 +338,15 @@ class ExecutionUnit:
         those files, that must be calculated by this application. The position bounding box will be the HEALpix
         coordinates for n=32.
         """
-        self._logger.debug('Begin _rename')
+        self._logger.debug('Begin _prepare')
         work = glob.glob('**/*.fits', root_dir=self._working_directory, recursive=True)
         for file_name in work:
-            self._logger.info(f'Working on {file_name}')
+            self._logger.debug(f'Working on {file_name}')
             found_storage_name = None
-            for storage_name in self._remote_metadata_reader.storage_names.values():
-                if storage_name.file_name == os.path.basename(file_name):
-                    found_storage_name = storage_name
+            for destination_uri in self._remote_metadata_reader.file_info.keys():
+                if os.path.basename(destination_uri) == os.path.basename(file_name):
+                    found_storage_name = PossumName(destination_uri)
+                    self._logger.error(id(found_storage_name))
                     break
 
             original_fqn = os.path.join(self._working_directory, file_name)
@@ -746,48 +355,12 @@ class ExecutionUnit:
             headers = self._remote_metadata_reader.headers.get(found_storage_name.file_uri)
             if headers:
                 renamed_file = self._find_new_file_name(headers[0], ('mfs' in found_storage_name.file_name))
-                found_storage_name.set_staging_name(renamed_file)
                 renamed_fqn = original_fqn.replace(os.path.basename(original_fqn), renamed_file)
                 os.rename(original_fqn, renamed_fqn)
                 self._logger.info(f'Renamed {original_fqn} to {renamed_fqn}.')
             else:
                 self._logger.warning(f'Could not find headers for {file_name}')
-        self._logger.debug('End _rename')
-
-    def _set_up_file_logging(self):
-        """Configure logging to a separate file for each execution unit.
-
-        If log_to_file is set to False, don't create a separate log file for each entry, because the application
-        should leave as small a logging trace as possible.
-        """
-        if self._log_fqn and self._logging_level:
-            self._log_handler = logging.FileHandler(self._log_fqn)
-            formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(name)-12s:%(lineno)d:%(message)s')
-            self._log_handler.setLevel(self._logging_level)
-            self._log_handler.setFormatter(formatter)
-            logging.getLogger().addHandler(self._log_handler)
-
-    def _unset_file_logging(self):
-        """Turn off the logging to the separate file for each entry being
-        processed."""
-        if self._log_handler:
-            logging.getLogger().removeHandler(self._log_handler)
-            self._log_handler.flush()
-            self._log_handler.close()
-
-
-class ExecutionUnitOrganizeExecutes(OrganizeExecutes):
-    """A class to do nothing except be "not None" when called."""
-
-    def __init__(self):
-        pass
-
-    def choose(self):
-        # do nothing for the over-arching StateRunner
-        pass
-
-    def do_one(self, _):
-        raise NotImplementedError
+        self._logger.debug('End _prepare')
 
 
 def remote_execution():
@@ -807,7 +380,8 @@ def remote_execution():
     observable = Observable(config)
     reporter = ExecutionReporter(config, observable)
     reporter.set_log_location(config)
-    metadata_reader = RemoteMetadataReader()
+    builder = EntryBuilder(PossumName)
+    metadata_reader = RemoteRcloneMetadataReader(builder)
     organizer = ExecutionUnitOrganizeExecutes()
     clients = RCloneClients(config)
     StorageName.collection = config.collection
@@ -815,7 +389,6 @@ def remote_execution():
     StorageName.scheme = config.scheme
     kwargs = {
         'clients': clients,
-        'observable': observable,
         'reporter': reporter,
     }
     data_sources = []
@@ -832,7 +405,6 @@ def remote_execution():
         config,
         organizer,
         data_sources=data_sources,
-        observable=observable,
         reporter=reporter,
     )
     result = runner.run()

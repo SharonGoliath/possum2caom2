@@ -68,7 +68,7 @@
 
 import logging
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from glob import glob
 from os import listdir
 from os.path import exists
@@ -78,6 +78,9 @@ from caom2utils.data_util import get_local_file_headers
 from possum2caom2 import possum_execute, storage_name
 from caom2pipe.manage_composable import CadcException, ExecutionReporter, make_datetime, Observable, read_obs_from_file
 from caom2pipe.manage_composable import State, TaskType
+from caom2pipe.name_builder_composable import EntryBuilder
+from caom2pipe.reader_composable import RemoteRcloneMetadataReader
+from caom2pipe.run_composable import ExecutionUnitStateRunner
 from mock import ANY, call, Mock, patch, PropertyMock
 
 
@@ -93,67 +96,18 @@ def test_renaming_options():
         assert test_subject.rename('') == renamed, f'wrong renamed {original}\n{test_subject.rename("")}\n{renamed}'
 
 
-def test_execution_unit_start_stop(test_config, tmp_path):
-    kwargs = {
-        'clients': None,
-        'data_source': None,
-        'metadata_reader': None,
-        'observable': None,
-        'reporter': None,
-        'prev_exec_dt': make_datetime('2023-10-28T20:47:49.000000000Z'),
-        'exec_dt': make_datetime('2023-11-28T20:47:49.000000000Z'),
-    }
-    test_config.change_working_directory(tmp_path)
-    test_config.cleanup_files_when_storing = True
-    test_subject = possum_execute.ExecutionUnit(test_config, **kwargs)
-
-    # preconditions
-    test_files = listdir(tmp_path)
-    assert len(test_files) == 0, 'directory should be empty'
-
-    test_subject.start()
-
-    test_files = listdir(tmp_path)
-    assert len(test_files) == 1, 'directory should have a workspace directory'
-    assert '2023-10-28T20_47_49_2023-11-28T20_47_49' in test_files, 'wrong working directory'
-
-    test_subject.stop()
-
-    test_files = listdir(tmp_path)
-    assert len(test_files) == 0, 'post-condition directory should be cleaned up and empty'
-
-    test_config.cleanup_files_when_storing = False
-    test_subject = possum_execute.ExecutionUnit(test_config, **kwargs)
-
-    # preconditions
-    test_files = listdir(tmp_path)
-    assert len(test_files) == 0, 'directory should be empty'
-
-    test_subject.start()
-
-    test_files = listdir(tmp_path)
-    assert len(test_files) == 1, 'directory should have a workspace directory'
-    assert '2023-10-28T20_47_49_2023-11-28T20_47_49' in test_files, 'wrong working directory'
-
-    test_subject.stop()
-
-    test_files = listdir(tmp_path)
-    assert len(test_files) == 0, 'post-condition empty directory should not exist'
-
-
 # need test_config parameter so StorageName.collection is set
-@patch('possum2caom2.possum_execute.compute_md5sum')
 @patch('caom2utils.data_util.get_local_headers_from_fits')
-def test_remote_metadata_reader_file_info_and_todo_reader(header_mock, md5_mock, test_config, test_data_dir):
+def test_remote_metadata_reader_file_info_and_todo_reader(header_mock, test_config, test_data_dir):
     header_mock.return_value = []
-    md5_mock.return_value = 'abc'
 
     input_file = f'{test_data_dir}/storage_mock/rclone_lsjson.json'
     test_file_uri = 'cadc:POSSUM/PSM.band1.0049-51.10887.i.fits'
-    test_subject = possum_execute.RemoteMetadataReader()
+    test_builder = EntryBuilder(storage_name.PossumName)
+    test_subject = RemoteRcloneMetadataReader(test_builder)
 
     with open(input_file) as f:
-        test_subject.set_file_info(f.read())
+        test_subject.seed(f.read())
 
     assert len(test_subject.file_info) == 4, 'wrong number of results'
     test_result = test_subject.file_info.get(test_file_uri)
@@ -162,26 +116,24 @@ def test_remote_metadata_reader_file_info_and_todo_reader(header_mock, md5_mock,
     assert test_result.file_type == 'application/fits', 'wrong file type'
     assert test_result.lastmod == datetime(2023, 11, 18, 20, 47, 50), 'wrong modification time'
 
+    assert len(test_subject.storage_names) == 4, 'wrong number of results'
+    test_result_storage_name = test_subject.storage_names.get(test_file_uri)
+    assert test_result_storage_name is not None, 'expect a result'
+    assert test_result_storage_name.file_info is not None, 'expect  file info result'
+    assert test_result_storage_name.file_info.size == test_result.size, 'wrong size'
+    assert test_result_storage_name.file_info.file_type == test_result.file_type, 'wrong file type'
+    assert test_result_storage_name.file_info.lastmod == test_result.lastmod, 'wrong modification time'
+    assert test_result_storage_name.metadata is None, 'expect no metadata yet'
+
+    test_storage_name_in = storage_name.PossumName(test_result.id)
+    test_subject.set_headers(test_storage_name_in, test_result.id)
+
     test_storage_name = test_subject.storage_names.get(test_file_uri)
     assert test_storage_name.file_uri == test_file_uri, 'wrong file uri'
 
-    test_storage_name.rename('944MHz')
-    final_file_name = 'PSM_944MHz_20asec_0049-5100_10887_i_v1.fits'
-    assert test_storage_name.stage_names[0] == final_file_name
-    test_storage_name_renamed = storage_name.PossumName(f'/tmp/{final_file_name}')
-    test_subject_2 = possum_execute.TodoMetadataReader(test_subject)
-    test_subject_2.set(test_storage_name_renamed)
-    assert len(test_subject_2.file_info) == 1, 'wrong bit of file_info'
-    test_file_info_result = test_subject_2.file_info.get(f'cadc:POSSUM/{final_file_name}')
-    assert test_file_info_result.size == 4831848000, 'renamed wrong size'
-    assert test_file_info_result.file_type == 'application/fits', 'renamed wrong file type'
-    assert test_file_info_result.lastmod == datetime(2023, 11, 18, 20, 47, 50), 'renamed wrong modification time'
-    assert test_file_info_result.md5sum == 'md5:abc', 'renamed wrong md5sum'
-    assert len(test_subject_2.headers) == 1, 'wrong header content'
-
 
 @patch('possum2caom2.possum_execute.exec_cmd')
-@patch('possum2caom2.possum_execute.exec_cmd_info')
+@patch('caom2pipe.manage_composable.exec_cmd_info')
 def test_remote_data_source(exec_cmd_info_mock, exec_cmd_mock, test_data_dir, test_config, tmp_path):
     with open(f'{test_data_dir}/storage_mock/rclone_lsjson.json') as f:
         exec_cmd_info_mock.return_value = f.read()
@@ -193,14 +145,13 @@ def test_remote_data_source(exec_cmd_info_mock, exec_cmd_mock, test_data_dir, te
     test_start_time = make_datetime('2023-10-28T20:47:49.000000000Z')
     test_end_time = make_datetime('2023-11-28T20:47:49.000000000Z')
     State.write_bookmark(test_config.state_fqn, test_start_key, test_start_time)
-    test_metadata_reader = possum_execute.RemoteMetadataReader()
+    test_builder = EntryBuilder(storage_name.PossumName)
+    test_metadata_reader = RemoteRcloneMetadataReader(test_builder)
     mock_1 = Mock()
     mock_2 = Mock()
-    mock_3 = Mock()
     kwargs = {
         'clients': mock_1,
-        'observable': mock_2,
-        'reporter': mock_3,
+        'reporter': mock_2,
     }
     test_subject = possum_execute.RemoteIncrementalDataSource(
         test_config,
@@ -208,7 +159,7 @@ def test_remote_data_source(exec_cmd_info_mock, exec_cmd_mock, test_data_dir, te
         test_metadata_reader,
         **kwargs,
     )
-    test_subject.reporter = mock_3
+    test_subject.reporter = mock_2
     test_subject.initialize_start_dt()
     assert test_subject.start_dt == datetime(2023, 10, 28, 20, 47, 49), 'start_dt'
     test_subject.initialize_end_dt()
@@ -216,72 +167,16 @@ def test_remote_data_source(exec_cmd_info_mock, exec_cmd_mock, test_data_dir, te
     test_result = test_subject.get_time_box_work(test_start_time, test_end_time)
     assert test_result is not None, 'expect a result'
     assert test_result._clients == mock_1, 'clients'
-    assert test_result._observable == mock_2, 'observable'
-    assert test_result._reporter == mock_3, 'reporter'
+    assert test_result._reporter == mock_2, 'reporter'
     assert test_result._remote_metadata_reader == test_metadata_reader, 'reader'
-    assert mock_3.capture_todo.called, 'capture_todo'
+    assert mock_2.capture_todo.called, 'capture_todo'
 
 
-def test_state_runner_reporter(test_config, tmp_path, change_test_dir):
-    # make sure the StateRunner goes through at least one time box check, and creates the
-    # right log locations
-    test_config.change_working_directory(tmp_path)
-    test_config.task_types = [TaskType.STORE, TaskType.INGEST, TaskType.MODIFY]
-    test_config.data_sources = ['test/acacia:possum1234']
-    test_config.interval = 60 * 48  # work in time-boxes of 2 days => 60m * 48h
-    test_organizer = Mock()
-    # the time-box times, or, this is "when" the code looks
-    test_start_time = make_datetime('2023-10-28T20:47:49.000000000Z')
-    test_end_time = make_datetime('2023-11-28T20:47:49.000000000Z')
-    test_data_source = Mock()
-    end_time_mock = PropertyMock(return_value=test_end_time)
-    start_time_mock = PropertyMock(return_value=test_start_time)
-    type(test_data_source).end_dt = end_time_mock
-    type(test_data_source).start_dt = start_time_mock
-    # the execution times, or, this is "what" the code finds
-    test_entry_time = make_datetime('2023-11-28T08:47:49.000000000Z')
-    execution_unit_mock = Mock()
-    type(execution_unit_mock).entry_dt = test_entry_time
-    type(execution_unit_mock).num_entries = 1
-    execution_unit_mock.do.return_value = 0
-    test_data_source.get_time_box_work.return_value = execution_unit_mock
-    test_data_sources = [test_data_source]
-    test_observable = Mock()
-    test_reporter = ExecutionReporter(test_config, test_observable)
-    test_subject = possum_execute.ExecutionUnitStateRunner(
-        test_config,
-        test_organizer,
-        test_data_sources,
-        test_observable,
-        test_reporter,
-    )
-    test_result = test_subject.run()
-    assert test_result is not None, 'expect a result'
-    assert test_result == 0, 'happy path'
-    assert test_organizer.mock_calls == [], 'organizer'
-    assert test_data_source.initialize_start_dt.called, 'initialize_start_dt'
-    assert test_data_source.initialize_start_dt.call_count == 1, 'initialize_start_dt count'
-    assert test_data_source.initialize_end_dt.called, 'initialize_end_dt'
-    assert test_data_source.initialize_end_dt.call_count == 1, 'initialize_end_dt count'
-    assert test_data_source.get_time_box_work.called, 'get_time_box_work'
-    # 16 == number of days / 2 between the start and end times
-    assert test_data_source.get_time_box_work.call_count == 16, 'get_time_box_work count'
-    test_observable.assert_has_calls([]), 'observable calls'
-    assert exists(test_config.failure_fqn), 'failure'
-    assert exists(test_config.progress_fqn), 'progress'
-    assert exists(test_config.success_fqn), 'success'
-    assert exists(test_config.retry_fqn), 'retries'
-    assert exists(test_config.total_retry_fqn), 'total_retries'
-    assert exists(test_config.report_fqn), 'report'
-    assert test_reporter.success == 0, 'reporter success'
-    assert test_reporter.all == 0, 'reporter all'
-
-
-@patch('possum2caom2.possum_execute.RemoteListDirDataSource.default_filter')
+@patch('caom2pipe.data_source_composable.RemoteListDirDataSource.default_filter')
 @patch('possum2caom2.preview_augmentation.visit')
 @patch('caom2utils.data_util.get_local_headers_from_fits')
 @patch('possum2caom2.possum_execute.exec_cmd')
-@patch('possum2caom2.possum_execute.exec_cmd_info')
+@patch('caom2pipe.manage_composable.exec_cmd_info')
 def test_state_runner_nominal_multiple_files(
     exec_cmd_info_mock,
     exec_cmd_mock,
@@ -325,7 +220,7 @@ def test_state_runner_nominal_multiple_files(
     exec_cmd_mock.side_effect = _exec_cmd_mock
     header_mock.side_effect = get_local_file_headers
     preview_mock.side_effect = (
-        lambda x, working_directory, storage_name, log_file_directory, clients, observable, metadata_reader, config: x
+        lambda x, working_directory, storage_name, log_file_directory, clients, reporter, metadata_reader, config: x
     )
     filter_mock.return_value = True
     test_config.change_working_directory(tmp_path)
@@ -341,7 +236,8 @@ def test_state_runner_nominal_multiple_files(
     test_start_time = make_datetime('2023-10-28T20:47:49.000000000Z')
     test_end_time = make_datetime('2023-11-18T20:47:50.000000000Z')
     State.write_bookmark(test_config.state_fqn, test_config.data_sources[0], test_start_time)
-    test_metadata_reader = possum_execute.RemoteMetadataReader()
+    test_builder = EntryBuilder(storage_name.PossumName)
+    test_metadata_reader = RemoteRcloneMetadataReader(test_builder)
     test_observable = Observable(test_config)
     test_reporter = ExecutionReporter(test_config, test_observable)
     test_clients = Mock()
@@ -349,8 +245,8 @@ def test_state_runner_nominal_multiple_files(
     test_observation = read_obs_from_file(f'{test_data_dir}/storage_mock/renaming_observation.xml')
     test_clients.server_side_ctor_client.read.side_effect = [test_observation, test_observation, test_observation]
     kwargs = {
+        'builder': test_builder,
         'clients': test_clients,
-        'observable': test_observable,
         'reporter': test_reporter
     }
     test_data_source = possum_execute.RemoteIncrementalDataSource(
@@ -361,13 +257,7 @@ def test_state_runner_nominal_multiple_files(
     )
     test_data_source.reporter = test_reporter
     test_data_sources = [test_data_source]
-    test_subject = possum_execute.ExecutionUnitStateRunner(
-        test_config,
-        test_organizer,
-        test_data_sources,
-        test_observable,
-        test_reporter,
-    )
+    test_subject = ExecutionUnitStateRunner(test_config, test_organizer, test_data_sources, test_reporter)
     test_result = test_subject.run()
     assert test_result is not None, 'expect a result'
     assert test_result == 0, 'happy path'
@@ -402,11 +292,11 @@ def test_state_runner_nominal_multiple_files(
     assert len(left_behind) + len(left_behind_2) == 3, 'no files cleaned up'
 
 
-@patch('possum2caom2.possum_execute.RemoteListDirDataSource.default_filter')
+@patch('caom2pipe.data_source_composable.RemoteListDirDataSource.default_filter')
 @patch('possum2caom2.preview_augmentation.visit')
 @patch('caom2utils.data_util.get_local_headers_from_fits')
 @patch('possum2caom2.possum_execute.exec_cmd')
-@patch('possum2caom2.possum_execute.exec_cmd_info')
+@patch('caom2pipe.manage_composable.exec_cmd_info')
 def test_state_runner_clean_up_when_storing_with_retry(
     exec_cmd_info_mock,
     exec_cmd_mock,
@@ -436,7 +326,7 @@ def test_state_runner_clean_up_when_storing_with_retry(
     exec_cmd_mock.side_effect = _exec_cmd_mock
     header_mock.side_effect = get_local_file_headers
     visit_mock.side_effect = (
-        lambda x, working_directory, storage_name, log_file_directory, clients, observable, metadata_reader, config: x
+        lambda x, working_directory, storage_name, log_file_directory, clients, reporter, metadata_reader, config: x
     )
     filter_mock.return_value = True
     test_config.change_working_directory(tmp_path)
@@ -455,7 +345,8 @@ def test_state_runner_clean_up_when_storing_with_retry(
     test_start_time = make_datetime('2023-10-28T20:47:49.000000000Z')
     test_end_time = make_datetime('2023-11-18T20:47:50.000000000Z')
     State.write_bookmark(test_config.state_fqn, test_config.data_sources[0], test_start_time)
-    test_metadata_reader = possum_execute.RemoteMetadataReader()
+    test_builder = EntryBuilder(storage_name.PossumName)
+    test_metadata_reader = RemoteRcloneMetadataReader(test_builder)
     test_observable = Observable(test_config)
     test_reporter = ExecutionReporter(test_config, test_observable)
     test_clients = Mock()
@@ -464,7 +355,6 @@ def test_state_runner_clean_up_when_storing_with_retry(
     test_clients.server_side_ctor_client.read.side_effect = [test_observation]
     kwargs = {
         'clients': test_clients,
-        'observable': test_observable,
         'reporter': test_reporter
     }
     test_data_source = possum_execute.RemoteIncrementalDataSource(
@@ -475,12 +365,8 @@ def test_state_runner_clean_up_when_storing_with_retry(
     )
     test_data_source.reporter = test_reporter
     test_data_sources = [test_data_source]
-    test_subject = possum_execute.ExecutionUnitStateRunner(
-        test_config,
-        test_organizer,
-        test_data_sources,
-        test_observable,
-        test_reporter,
+    test_subject = ExecutionUnitStateRunner(
+        test_config, test_organizer, test_data_sources, test_reporter
     )
     test_result = test_subject.run()
     assert test_result is not None, 'expect a result'
@@ -507,7 +393,7 @@ def test_state_runner_clean_up_when_storing_with_retry(
 
 
 @patch('possum2caom2.possum_execute.exec_cmd')
-@patch('possum2caom2.possum_execute.exec_cmd_info')
+@patch('caom2pipe.manage_composable.exec_cmd_info')
 @patch('possum2caom2.possum_execute.RCloneClients')
 def test_remote_execution(
     clients_mock, exec_cmd_info_mock, exec_cmd_mock, test_config, tmp_path, change_test_dir
@@ -559,7 +445,7 @@ def test_remote_execution(
     ), f'client mock {clients_mock.server_side_ctor_client.mock_calls}'
 
 
-@patch('possum2caom2.possum_execute.RemoteListDirDataSource.default_filter')
+@patch('caom2pipe.data_source_composable.RemoteListDirDataSource.default_filter')
 @patch('possum2caom2.fits2caom2_augmentation.visit')
 @patch('possum2caom2.possum_execute.RCloneClients')
 def test_remote_execute_with_local_commands(
@@ -609,7 +495,7 @@ def test_remote_execute_with_local_commands(
     ), f'client mock {clients_mock.server_side_ctor_client.mock_calls}'
 
 
-@patch('possum2caom2.possum_execute.ExecutionUnit.start')
+@patch('possum2caom2.possum_execute.PossumExecutionUnit.start')
 def test_empty_listing(start_mock, test_config, test_data_dir, tmp_path, change_test_dir):
     test_config.change_working_directory(tmp_path)
     test_config.cleanup_files_when_storing = True
@@ -627,7 +513,8 @@ def test_empty_listing(start_mock, test_config, test_data_dir, tmp_path, change_
     test_start_time = make_datetime('2023-10-28T20:47:49.000000000Z')
     test_end_time = make_datetime('2023-11-18T20:47:50.000000000Z')
     State.write_bookmark(test_config.state_fqn, test_config.data_sources[0], test_start_time)
-    test_metadata_reader = possum_execute.RemoteMetadataReader()
+    test_builder = EntryBuilder(storage_name.PossumName)
+    test_metadata_reader = RemoteRcloneMetadataReader(test_builder)
     test_observable = Observable(test_config)
     test_reporter = ExecutionReporter(test_config, test_observable)
     test_clients = Mock()
@@ -637,21 +524,14 @@ def test_empty_listing(start_mock, test_config, test_data_dir, tmp_path, change_
         'reporter': test_reporter
     }
     test_data_source = possum_execute.RemoteIncrementalDataSource(
-        test_config,
-        test_config.data_sources[0],
-        test_metadata_reader,
-        **kwargs,
+        test_config, test_config.data_sources[0], test_metadata_reader, **kwargs
     )
     end_time_mock = PropertyMock(return_value=test_end_time)
     type(test_data_source).end_dt = end_time_mock
     test_data_source.reporter = test_reporter
     test_data_sources = [test_data_source]
     test_subject = possum_execute.ExecutionUnitStateRunner(
-        test_config,
-        test_organizer,
-        test_data_sources,
-        test_observable,
-        test_reporter,
+        test_config, test_organizer, test_data_sources, test_reporter
     )
     test_result = test_subject.run()
     assert test_result is not None, 'expect a result'
